@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
@@ -80,9 +82,41 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		}
 	}
 
+	sighupCh := signals.SetupSIGHUPHandler(ctx)
+
+	var currentCmd *exec.Cmd
+	var cmdLock sync.Mutex
+	var restartRequested atomic.Bool
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighupCh:
+				logrus.Infof("SIGHUP received, regenerating containerd config and restarting containerd")
+				if err := SetupContainerdConfig(cfg); err != nil {
+					logrus.Errorf("Failed to regenerate containerd config: %v", err)
+					continue
+				}
+
+				restartRequested.Store(true)
+
+				cmdLock.Lock()
+				if currentCmd != nil && currentCmd.Process != nil {
+					if err := currentCmd.Process.Signal(os.Interrupt); err != nil {
+						logrus.Errorf("Failed to send SIGINT to containerd: %v", err)
+					}
+				}
+				cmdLock.Unlock()
+			}
+		}
+	}()
+
 	go func() {
 		env := []string{}
 		cenv := []string{}
+		extraArgs := []string{}
 
 		for _, e := range os.Environ() {
 			pair := strings.SplitN(e, "=", 2)
@@ -91,7 +125,7 @@ func Run(ctx context.Context, cfg *config.Node) error {
 				// elide NOTIFY_SOCKET to prevent spurious notifications to systemd
 			case pair[0] == "CONTAINERD_LOG_LEVEL":
 				// Turn CONTAINERD_LOG_LEVEL variable into log-level flag
-				args = append(args, "--log-level", pair[1])
+				extraArgs = append(extraArgs, "--log-level", pair[1])
 			case strings.HasPrefix(pair[0], "CONTAINERD_"):
 				// Strip variables with CONTAINERD_ prefix before passing through
 				// This allows doing things like setting a proxy for image pulls by setting
@@ -103,18 +137,55 @@ func Run(ctx context.Context, cfg *config.Node) error {
 			}
 		}
 
-		logrus.Infof("Running containerd %s", config.ArgString(args[1:]))
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		cmd.Stdout = stdOut
-		cmd.Stderr = stdErr
-		cmd.Env = append(env, cenv...)
+		firstRun := true
+		for {
+			args = getContainerdArgs(cfg)
+			args = append(args, extraArgs...)
+			logrus.Infof("Running containerd %s", config.ArgString(args[1:]))
+			cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+			cmd.Stdout = stdOut
+			cmd.Stderr = stdErr
+			cmd.Env = append(env, cenv...)
 
-		addDeathSig(cmd)
-		err := cmd.Run()
-		if err != nil && !errors.Is(err, context.Canceled) {
-			signals.RequestShutdown(pkgerrors.WithMessage(err, "containerd exited"))
+			addDeathSig(cmd)
+
+			cmdLock.Lock()
+			currentCmd = cmd
+			cmdLock.Unlock()
+
+			if err := cmd.Start(); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					signals.RequestShutdown(pkgerrors.WithMessage(err, "containerd failed to start"))
+				} else {
+					signals.RequestShutdown(nil)
+				}
+				return
+			}
+
+			if !firstRun {
+				if err := cri.WaitForService(ctx, cfg.Containerd.Address, "containerd"); err != nil {
+					logrus.Warnf("Failed to wait for containerd service during restart: %v", err)
+				} else {
+					if err := PreloadImages(ctx, cfg); err != nil {
+						logrus.Warnf("Failed to preload images during restart: %v", err)
+					}
+				}
+			}
+			firstRun = false
+
+			err := cmd.Wait()
+
+			if restartRequested.CompareAndSwap(true, false) {
+				logrus.Infof("Containerd exited, restarting...")
+				continue
+			}
+
+			if err != nil && !errors.Is(err, context.Canceled) {
+				signals.RequestShutdown(pkgerrors.WithMessage(err, "containerd exited"))
+			}
+			signals.RequestShutdown(nil)
+			return
 		}
-		signals.RequestShutdown(nil)
 	}()
 
 	if err := cri.WaitForService(ctx, cfg.Containerd.Address, "containerd"); err != nil {
